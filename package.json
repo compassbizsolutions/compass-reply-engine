@@ -1,0 +1,16 @@
+{
+  "name": "reply-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI-run local review reply engine — Phase 1 MVP (Compass Business Solutions).",
+  "main": "scripts/pollReviews.js",
+  "scripts": {
+    "poll": "node scripts/pollReviews.js",
+    "draft": "node scripts/draftReply.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5"
+  }
+}
