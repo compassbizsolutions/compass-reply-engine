@@ -80,10 +80,12 @@ Respond with exactly one line: SCATHING: <one-sentence reason> or NOT_SCATHING: 
 // grading its own work. Returns { passed, notes }.
 async function safetyCheck({ review, draftText, businessName }) {
   const system = `You are a strict pre-publication reviewer for AI-drafted replies to customer reviews.
-A reply FAILS the check if it is: defensive or sarcastic in tone, factually presumptuous (claims to know what happened when the review didn't say), promises a specific refund/discount amount, contains any personal or made-up employee name, or is generically off-topic for the review it's replying to.
+A reply FAILS the check if it is: defensive or sarcastic in tone, factually presumptuous (claims to know what happened when the review didn't say), promises a specific refund/discount amount, addresses the reviewer by a name OTHER than the one given below, invents the name of an employee or a specific person involved, or is generically off-topic for the review it's replying to.
+It is FINE and expected for the reply to address the reviewer by the name given below (e.g. "Thanks, <name>!") — that is not a made-up name, it's the actual reviewer being greeted by name.
 Respond with exactly one line in this format: PASS or FAIL: <one-sentence reason>`;
 
   const userMsg = `Business: ${businessName}
+Reviewer's actual name (fine to use in the reply): ${review.reviewer_name || '(not given — any name used in the reply would be made up)'}
 Original review (${review.rating} stars): "${review.review_text || '(no written comment)'}"
 Drafted reply: "${draftText}"`;
 

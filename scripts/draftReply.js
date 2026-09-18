@@ -3,6 +3,11 @@
 // Called directly by pollReviews.js for each new review — not meant to be run standalone,
 // though `node scripts/draftReply.js <review_id>` works for manual testing.
 
+// Loaded here (not just in the manual-test block below) because db.js reads env vars the
+// moment it's required, and require() calls run before any code below them — so .env must
+// be loaded before the require('../src/db') line, not after it.
+require('dotenv').config();
+
 const { supabase, logAction } = require('../src/db');
 const { draftReply, safetyCheck, assessSeverity } = require('../src/llm');
 const { postApprovedReply } = require('./postReply');
@@ -108,7 +113,6 @@ async function draftAndHandleReply(review, businessId) {
 
 // Manual-test entrypoint: node scripts/draftReply.js <review_id>
 if (require.main === module) {
-  require('dotenv').config();
   const reviewId = process.argv[2];
   if (!reviewId) {
     console.error('Usage: node scripts/draftReply.js <review_id>');
