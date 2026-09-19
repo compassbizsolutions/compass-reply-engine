@@ -6,11 +6,13 @@
   "main": "scripts/pollReviews.js",
   "scripts": {
     "poll": "node scripts/pollReviews.js",
-    "draft": "node scripts/draftReply.js"
+    "draft": "node scripts/draftReply.js",
+    "dashboard": "node scripts/dashboard.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
     "@supabase/supabase-js": "^2.45.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
   }
 }
