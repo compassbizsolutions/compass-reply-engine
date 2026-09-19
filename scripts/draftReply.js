@@ -11,6 +11,7 @@ require('dotenv').config();
 const { supabase, logAction } = require('../src/db');
 const { draftReply, safetyCheck, assessSeverity } = require('../src/llm');
 const { postApprovedReply } = require('./postReply');
+const { PLATFORMS } = require('../src/platforms');
 
 async function draftAndHandleReply(review, businessId) {
   const { data: business, error: bizErr } = await supabase
@@ -60,11 +61,18 @@ async function draftAndHandleReply(review, businessId) {
     check = { passed: false, notes: 'FAIL: safety check call errored, holding for manual review' };
   }
 
-  // Held for the owner, regardless of how clean the draft is, when either is true:
-  // (a) low star rating (spec §5 "negative-review flag"), or (b) the text itself reads as
-  // scathing/serious even at 3+ stars (assessed above, before drafting). The owner decides
-  // whether and how to respond personally in both cases.
-  const forceHold = review.rating <= 2 || severity.scathing;
+  // Whether this platform can even post a reply automatically at all. Facebook has no reply
+  // API and Yelp has no API access, period — those are always held for the owner to copy the
+  // draft over by hand, independent of star rating or how the draft/safety checks came out.
+  const platformCanAutoPost = Boolean(PLATFORMS[review.platform]?.canAutoPost);
+
+  // Held for the owner, regardless of how clean the draft is, when any of these is true:
+  // (a) low star rating (spec §5 "negative-review flag"), (b) the text itself reads as
+  // scathing/serious even at 3+ stars (assessed above, before drafting), or (c) the platform
+  // doesn't support automated posting in the first place. The owner decides whether/how to
+  // respond personally in the first two cases; in the third, there's simply no API to post
+  // through, so "holding" just means "drafted and waiting for you to copy it over."
+  const forceHold = review.rating <= 2 || severity.scathing || !platformCanAutoPost;
   const holdForReview = forceHold || !check.passed;
 
   const { data: reply, error: replyErr } = await supabase
@@ -98,7 +106,9 @@ async function draftAndHandleReply(review, businessId) {
       ? 'low_star_rating'
       : severity.scathing
         ? 'scathing_review_text'
-        : 'failed_safety_check';
+        : !platformCanAutoPost
+          ? 'platform_has_no_auto_post'
+          : 'failed_safety_check';
     await logAction(businessId, 'reply_flagged', {
       review_id: review.id,
       reason,

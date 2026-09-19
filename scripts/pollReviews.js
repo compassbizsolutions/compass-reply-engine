@@ -1,19 +1,25 @@
 #!/usr/bin/env node
-// Phase 1 pipeline, step 1: poll every active business's connected Google Business Profile
-// for new reviews, upsert them into the `reviews` table, and kick off reply drafting for
-// anything new. Meant to be run on a schedule (n8n / cron — see workflows/README.md).
+// Phase 1 pipeline, step 1: poll every active business's connected review platforms for new
+// reviews, upsert them into the `reviews` table, and kick off reply drafting for anything new.
+// Meant to be run on a schedule (n8n / cron — see workflows/README.md).
+//
+// Polls every platform in PLATFORMS with canFetch: true (currently google, trustpilot,
+// facebook). Yelp has no API access at all, so it's excluded here — those reviews come in
+// through the dashboard's manual-entry form instead (see scripts/dashboard.js).
 //
 // Usage: node scripts/pollReviews.js
 
 require('dotenv').config();
 const { supabase, logAction } = require('../src/db');
-const { getValidAccessToken, fetchReviews } = require('../src/googleBusinessProfile');
+const { PLATFORMS, POLLABLE_PLATFORMS } = require('../src/platforms');
 const { draftAndHandleReply } = require('./draftReply');
 
 async function pollBusiness(connection) {
+  const platform = PLATFORMS[connection.platform];
+
   let accessToken;
   try {
-    accessToken = await getValidAccessToken(connection, supabase);
+    accessToken = await platform.getValidAccessToken(connection, supabase);
   } catch (err) {
     if (err.code === 'REAUTH_REQUIRED') {
       await supabase
@@ -23,16 +29,16 @@ async function pollBusiness(connection) {
       await logAction(connection.business_id, 'reauth_required', { platform: connection.platform });
       // TODO (Section 6 of spec): trigger the automated "reconnect" email here.
     } else {
-      console.error(`[pollReviews] token error for business ${connection.business_id}:`, err.message);
+      console.error(`[pollReviews] token error for business ${connection.business_id} (${connection.platform}):`, err.message);
     }
     return;
   }
 
   let fetched;
   try {
-    fetched = await fetchReviews(connection, accessToken);
+    fetched = await platform.fetchReviews(connection, accessToken);
   } catch (err) {
-    console.error(`[pollReviews] fetch error for business ${connection.business_id}:`, err.message);
+    console.error(`[pollReviews] fetch error for business ${connection.business_id} (${connection.platform}):`, err.message);
     return;
   }
 
@@ -44,6 +50,7 @@ async function pollBusiness(connection) {
         {
           business_id: connection.business_id,
           platform: connection.platform,
+          entry_method: 'api',
           ...review
         },
         { onConflict: 'platform,external_review_id', ignoreDuplicates: false }
@@ -72,7 +79,7 @@ async function main() {
   const { data: connections, error } = await supabase
     .from('platform_connections')
     .select('*, businesses!inner(subscription_status)')
-    .eq('platform', 'google')
+    .in('platform', POLLABLE_PLATFORMS)
     .eq('status', 'active')
     .eq('businesses.subscription_status', 'active');
 
@@ -81,9 +88,9 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`[pollReviews] polling ${connections.length} connected business(es)...`);
+  console.log(`[pollReviews] polling ${connections.length} connected business(es) across ${POLLABLE_PLATFORMS.join(', ')}...`);
 
-  // Sequential on purpose for the MVP — simple, avoids Google rate limits.
+  // Sequential on purpose for the MVP — simple, avoids per-platform rate limits.
   // Parallelize with a concurrency limiter (p-limit) once volume justifies it.
   for (const connection of connections) {
     await pollBusiness(connection);
