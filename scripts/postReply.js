@@ -1,6 +1,9 @@
 // Phase 1 pipeline, step 3: post an approved (safety-check-passed, not held) reply back to
 // Google, and log the result. Also exposes postManuallyApproved() for the dashboard's
 // "approve this held reply" button — same posting logic, different entry trigger.
+//
+// Both functions return { success, reason } so callers (the dashboard especially) can show
+// the person WHY a post attempt did nothing, instead of it looking like the button is broken.
 
 const { supabase, logAction } = require('../src/db');
 const { getValidAccessToken, postReply } = require('../src/googleBusinessProfile');
@@ -14,8 +17,10 @@ async function postApprovedReply(review, reply, businessId) {
     .single();
 
   if (error || !connection) {
-    console.error(`[postReply] no active ${review.platform} connection for business ${businessId}`);
-    return;
+    const reason = `No active ${review.platform} connection for this business yet — connect it before replies can post.`;
+    console.error(`[postReply] ${reason} (business ${businessId})`);
+    await logAction(businessId, 'reply_post_failed', { review_id: review.id, reason });
+    return { success: false, reason };
   }
 
   try {
@@ -23,8 +28,8 @@ async function postApprovedReply(review, reply, businessId) {
     await postReply(connection, accessToken, review.external_review_id, reply.draft_text);
   } catch (err) {
     console.error(`[postReply] failed to post reply ${reply.id}:`, err.message);
-    await logAction(businessId, 'reply_post_failed', { review_id: review.id, error: err.message });
-    return;
+    await logAction(businessId, 'reply_post_failed', { review_id: review.id, reason: err.message });
+    return { success: false, reason: err.message };
   }
 
   const now = new Date().toISOString();
@@ -40,6 +45,7 @@ async function postApprovedReply(review, reply, businessId) {
     .eq('id', review.id);
 
   await logAction(businessId, 'reply_posted', { review_id: review.id, reply_id: reply.id });
+  return { success: true };
 }
 
 // Called from the dashboard when an owner manually approves a held reply
@@ -52,10 +58,12 @@ async function postManuallyApproved(replyId) {
     .eq('id', replyId)
     .single();
 
-  if (replyErr || !reply) throw replyErr || new Error('reply not found');
+  if (replyErr || !reply) {
+    return { success: false, reason: (replyErr && replyErr.message) || 'reply not found' };
+  }
 
   const review = reply.reviews;
-  await postApprovedReply(review, reply, review.business_id);
+  return postApprovedReply(review, reply, review.business_id);
 }
 
 module.exports = { postApprovedReply, postManuallyApproved };

@@ -28,6 +28,12 @@ function starDisplay(rating) {
 }
 
 app.get('/', async (req, res) => {
+  const banner = req.query.error
+    ? `<div class="banner banner-error">Couldn't post that reply: ${escapeHtml(req.query.error)}</div>`
+    : req.query.posted
+      ? `<div class="banner banner-success">Reply posted.</div>`
+      : '';
+
   const { data: replies, error } = await supabase
     .from('replies')
     .select('*, reviews!inner(*, businesses!inner(name))')
@@ -103,25 +109,34 @@ app.get('/', async (req, res) => {
     .btn-approve:hover { background: #237032; }
     .btn-dismiss { background: #e9ecef; color: #495057; }
     .btn-dismiss:hover { background: #dee2e6; }
+    .banner { max-width: 680px; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .banner-error { background: #fff3bf; color: #7d5a00; border: 1px solid #ffe066; }
+    .banner-success { background: #d3f9d8; color: #2b8a3e; border: 1px solid #b2f2bb; }
   </style>
 </head>
 <body>
   <h1>Review Queue</h1>
   <p class="subtitle">${(replies || []).length} item(s) waiting for your decision</p>
+  ${banner}
   ${rows || '<div class="empty">Nothing waiting right now — the queue is clear.</div>'}
 </body>
 </html>`);
 });
 
 app.post('/approve/:replyId', async (req, res) => {
+  let result;
   try {
-    await postManuallyApproved(req.params.replyId);
+    result = await postManuallyApproved(req.params.replyId);
   } catch (err) {
     console.error('[dashboard] approve failed:', err.message);
-    // Posting can legitimately fail here if there's no real Google connection yet
-    // (expected during testing) — still send them back to the queue either way.
+    result = { success: false, reason: err.message };
   }
-  res.redirect('/');
+
+  if (result.success) {
+    res.redirect('/?posted=1');
+  } else {
+    res.redirect(`/?error=${encodeURIComponent(result.reason || 'unknown error')}`);
+  }
 });
 
 app.post('/dismiss/:reviewId', async (req, res) => {
