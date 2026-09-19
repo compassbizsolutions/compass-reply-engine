@@ -1,0 +1,933 @@
+From 5f27d43e04642b81b33498b3d2d304b740f5fe40 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 19 Sep 2026 01:42:50 -0400
+Subject: [PATCH] Add Trustpilot (full auto) and Facebook (fetch-only)
+ integrations, Yelp manual entry
+
+Yelp has no public API for reading or replying to reviews (Partner API is invite-only,
+aimed at large reputation platforms), and Facebook's Graph API has no reply-posting
+endpoint for ratings/recommendations at all -- neither is a gap that permissions or a
+different approach can close. Rather than scrape/automate logins against either site
+(a real ToS and account-suspension risk for customers, not worth it for this product),
+both now flow through the same AI-drafting and safety-check pipeline as Google, just
+always held for the owner to copy the reply over by hand instead of auto-posting.
+
+- src/platforms.js: central registry of what each platform (google, trustpilot,
+  facebook, yelp) can fetch and auto-post -- draftReply/pollReviews/dashboard all read
+  capabilities from here instead of hardcoding platform names
+- src/trustpilot.js: fetch (API key) + reply (OAuth business-user token) -- genuinely
+  full automation, on par with Google
+- src/facebook.js: fetch only (Graph API ratings/recommendations) -- always held
+- dashboard.js: new "Add a Yelp review manually" form feeding the same pipeline;
+  queue cards now show "Approve & Post" for auto-postable platforms or "Copy Reply &
+  Mark Sent" (with clipboard copy) for the rest
+- draftReply.js: hold-for-review now also triggers when the platform itself has no
+  posting API, independent of star rating or safety-check result
+- sql/002_multi_platform.sql: adds reviews.entry_method (api | manual)
+---
+ .env.example               |  12 ++
+ README.md                  |  65 +++++++----
+ scripts/dashboard.js       | 227 +++++++++++++++++++++++++++++++------
+ scripts/draftReply.js      |  22 +++-
+ scripts/pollReviews.js     |  29 +++--
+ scripts/postReply.js       |  55 ++++++++-
+ sql/002_multi_platform.sql |  13 +++
+ src/facebook.js            |  54 +++++++++
+ src/platforms.js           |  56 +++++++++
+ src/trustpilot.js          | 109 ++++++++++++++++++
+ 10 files changed, 563 insertions(+), 79 deletions(-)
+ create mode 100644 sql/002_multi_platform.sql
+ create mode 100644 src/facebook.js
+ create mode 100644 src/platforms.js
+ create mode 100644 src/trustpilot.js
+
+diff --git a/.env.example b/.env.example
+index 45bfba8..a055a1a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -10,3 +10,15 @@ ANTHROPIC_API_KEY=your-anthropic-api-key
+ # Google Business Profile OAuth app (Google Cloud Console)
+ GOOGLE_CLIENT_ID=your-google-oauth-client-id
+ GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
++
++# Trustpilot Service Reviews API (business.trustpilot.com → API registration)
++# API key reads reviews; client id/secret are used to refresh a connected business's
++# reply-posting OAuth token (see src/trustpilot.js).
++TRUSTPILOT_API_KEY=your-trustpilot-api-key
++TRUSTPILOT_CLIENT_ID=your-trustpilot-oauth-client-id
++TRUSTPILOT_CLIENT_SECRET=your-trustpilot-oauth-client-secret
++
++# Facebook Graph API app (developers.facebook.com) — used to obtain each connected business's
++# long-lived Page access token (fetch-only; there is no reply-posting endpoint, see src/facebook.js)
++FACEBOOK_APP_ID=your-facebook-app-id
++FACEBOOK_APP_SECRET=your-facebook-app-secret
+diff --git a/README.md b/README.md
+index 2a3d9a9..31452d0 100644
+--- a/README.md
++++ b/README.md
+@@ -1,29 +1,49 @@
+ # Reply Engine — Phase 1 MVP
+ 
+ The review-monitoring + AI auto-reply pipeline from the Compass "AI-Run Local Reputation
+-Engine" spec (Section 8, Phase 1). This is the first slice: connect a Google Business
+-Profile, detect new reviews, draft a reply in the business's tone, run an independent
+-safety check, and either auto-post it or hold it for the owner — no manual work once it's
+-running.
++Engine" spec (Section 8, Phase 1). Connect Google Business Profile and/or Trustpilot,
++detect new reviews, draft a reply in the business's tone, run an independent safety check,
++and either auto-post it or hold it for the owner — no manual work once it's running.
++Facebook reviews are fetched automatically too but always held for manual copy-paste
++(Meta's API has no reply-posting endpoint at all), and Yelp reviews are entered by hand
++through the dashboard (Yelp has no public API access for reviews, period) — both still go
++through the same AI-drafting and safety-check pipeline as everything else.
+ 
+ Not in this slice (see spec Sections 3–4, 8 for what comes next): the customer-facing
+-signup/dashboard app, Stripe checkout, the onboarding tone-quiz UI, Yelp/Facebook,
+-POS-triggered review requests, and the weekly summary email. This folder is the engine
+-those pieces will sit on top of.
++signup/dashboard app, Stripe checkout, the onboarding tone-quiz UI, POS-triggered review
++requests, and the weekly summary email. This folder is the engine those pieces will sit on
++top of.
++
++## Platform support at a glance
++
++See `src/platforms.js` for the single source of truth on this — draftReply.js,
++pollReviews.js, and dashboard.js all read capabilities from there rather than hardcoding
++platform names.
++
++| Platform   | Fetch reviews via API | Auto-post replies | Notes |
++|------------|:---:|:---:|---|
++| Google     | ✅ | ✅ | Full automation. |
++| Trustpilot | ✅ | ✅ | Full automation, but requires the business to have their own Trustpilot Business account for the reply OAuth token. |
++| Facebook   | ✅ | ❌ | Graph API has no reply endpoint for ratings/recommendations — never will, not a permissions issue. Held for manual copy every time. |
++| Yelp       | ❌ | ❌ | No public API access at all (Partner API is invite-only, aimed at large reputation platforms). Entered manually via `/add-review` in the dashboard. |
+ 
+ ## How it fits together
+ 
+ ```
+ pollReviews.js  (scheduled, e.g. hourly)
+-  → googleBusinessProfile.js: fetch new reviews for every active business
++  → src/platforms.js: fetch new reviews for every active business, per connected platform
++    (google, trustpilot, facebook — everything with canFetch: true)
+   → reviews table: upsert (idempotent — safe to re-run)
++  Yelp reviews instead come in via dashboard.js's "Add a Yelp review manually" form,
++  which calls draftAndHandleReply() directly — same pipeline, different entry point.
+   → for each new review → draftReply.js
+       → llm.js assessSeverity(): checked BEFORE drafting, independent of star rating —
+         catches a furious/scathing 3+ star review that shouldn't get an automated reply
+       → llm.js draftReply(): draft a reply in the business's tone
+       → llm.js safetyCheck(): a SEPARATE model call grades the draft
+-      → 1–2 stars, OR scathing text, OR safety check fails → hold for owner (status = 'flagged')
+-      → otherwise → postReply.js → googleBusinessProfile.js: post to Google, log it
++      → 1–2 stars, OR scathing text, OR safety check fails, OR the platform has no posting
++        API at all (Facebook/Yelp) → hold for owner (status = 'flagged')
++      → otherwise → postReply.js → src/platforms.js: post to Google/Trustpilot, log it
+ ```
+ 
+ Every step writes to `automation_log` — that table is what the monthly human spot-check
+@@ -31,20 +51,27 @@ Every step writes to `automation_log` — that table is what the monthly human s
+ 
+ ## Setup
+ 
+-1. **Supabase project** — create one, then run `sql/001_init_schema.sql` in the SQL editor.
++1. **Supabase project** — create one, then run `sql/001_init_schema.sql` followed by
++   `sql/002_multi_platform.sql` in the SQL editor.
+ 2. **Google Cloud project** — enable the Business Profile API, create OAuth credentials.
+    (Confirm current API name/endpoints at build time — Google has restructured this API
+    before; `src/googleBusinessProfile.js` has a note on this.)
+-3. **Anthropic API key** — console.anthropic.com.
+-4. `cp .env.example .env` and fill in all four values.
+-5. `npm install`
+-6. For each business you're piloting (manually, for now — see spec Section 8 Phase 2):
++3. **Trustpilot** (optional, only if a pilot business uses it) — register at
++   business.trustpilot.com for API access, get an API key plus an OAuth client id/secret.
++4. **Facebook** (optional) — create a Meta developer app, get a long-lived Page access
++   token per business (`pages_read_engagement` scope is enough — fetch-only).
++5. **Anthropic API key** — console.anthropic.com.
++6. `cp .env.example .env` and fill in whichever values apply to the platforms you're using.
++7. `npm install`
++8. For each business you're piloting (manually, for now — see spec Section 8 Phase 2):
+    - Insert a row into `businesses`
+    - Insert a row into `tone_profiles` for it (tone, negative-review policy, sign-off, etc.)
+-   - Complete the Google OAuth flow once (manual for now) and insert the resulting tokens
+-     into `platform_connections`
+-7. `npm run poll` to run one polling cycle manually and confirm it works end to end.
+-8. Once confirmed, schedule it — see `workflows/README.md` for the cron/n8n setup.
++   - For Google/Trustpilot/Facebook: complete the OAuth flow (or grab a Page token) once,
++     manually, and insert the resulting tokens into `platform_connections`
++   - For Yelp: nothing to connect — reviews get added via the dashboard's
++     "Add a Yelp review manually" link as they come in
++9. `npm run poll` to run one polling cycle manually and confirm it works end to end.
++10. Once confirmed, schedule it — see `workflows/README.md` for the cron/n8n setup.
+ 
+ ## What still needs a human right now
+ 
+diff --git a/scripts/dashboard.js b/scripts/dashboard.js
+index e5fa8ad..c92c54d 100644
+--- a/scripts/dashboard.js
++++ b/scripts/dashboard.js
+@@ -1,16 +1,25 @@
+ #!/usr/bin/env node
+ // A small local review-queue dashboard — NOT the customer-facing product (that's Phase 2's
+ // self-serve signup/dashboard). This is just for you: a page listing every reply the
+-// pipeline held for review, with the original review beside it and one-click Approve
+-// (posts it, using the same postApprovedReply path the automated pipeline uses) or
+-// Dismiss (marks the review as skipped so it stops showing here).
++// pipeline held for review, with the original review beside it and one-click:
++//   - "Approve & Post" for platforms with a real posting API (Google, Trustpilot) — this
++//     actually calls out and posts the reply.
++//   - "Copy Reply" for platforms with no posting API at all (Facebook, Yelp) — copies the
++//     drafted text to your clipboard and marks it as handled once you confirm you sent it.
++//   - "Dismiss" (marks the review as skipped so it stops showing here) on any of them.
++//
++// Also includes a manual-entry form (/add-review) for Yelp, since there's no API access to
++// poll Yelp reviews automatically — paste one in and it goes through the same AI-drafting and
++// safety-check pipeline as everything else.
+ //
+ // Run with: npm run dashboard, then open http://localhost:3001
+ 
+ require('dotenv').config();
+ const express = require('express');
+ const { supabase } = require('../src/db');
+-const { postManuallyApproved } = require('./postReply');
++const { postManuallyApproved, markManuallySent } = require('./postReply');
++const { draftAndHandleReply } = require('./draftReply');
++const { PLATFORMS } = require('../src/platforms');
+ 
+ const app = express();
+ const PORT = process.env.DASHBOARD_PORT || 3001;
+@@ -27,12 +36,61 @@ function starDisplay(rating) {
+   return '★'.repeat(rating) + '☆'.repeat(5 - rating);
+ }
+ 
++const PAGE_STYLES = `
++    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f7f7f8; margin: 0; padding: 2rem; color: #1a1a1a; }
++    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
++    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; font-size: 0.9rem; }
++    .empty { background: white; border-radius: 8px; padding: 2rem; text-align: center; color: #666; }
++    .card { background: white; border-radius: 8px; padding: 1.25rem 1.5rem; margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); max-width: 680px; }
++    .card-header { display: flex; gap: 0.75rem; align-items: baseline; margin-bottom: 0.5rem; flex-wrap: wrap; }
++    .business { font-weight: 600; }
++    .platform-tag { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; background: #edf1ff; color: #3b5bdb; padding: 0.1rem 0.45rem; border-radius: 4px; font-weight: 700; }
++    .stars { color: #f5a623; letter-spacing: 1px; }
++    .reviewer { color: #666; font-size: 0.9rem; }
++    .review-text { font-style: italic; color: #333; border-left: 3px solid #ddd; padding-left: 0.75rem; margin: 0.75rem 0; }
++    .draft-box { background: #f0f4ff; border-radius: 6px; padding: 0.75rem 1rem; margin: 0.75rem 0; }
++    .draft-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #3b5bdb; font-weight: 600; margin-bottom: 0.25rem; }
++    .draft-text { margin: 0; }
++    .notes { font-size: 0.85rem; margin: 0.5rem 0 1rem; }
++    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600; font-size: 0.75rem; margin-right: 0.5rem; }
++    .badge-pass { background: #d3f9d8; color: #2b8a3e; }
++    .badge-fail { background: #ffe3e3; color: #c92a2a; }
++    .badge-manual { background: #fff3bf; color: #7d5a00; }
++    .notes-text { color: #888; }
++    .manual-note { font-size: 0.82rem; color: #7d5a00; background: #fff9db; border-radius: 6px; padding: 0.5rem 0.75rem; margin: 0.5rem 0; }
++    .actions { display: inline-block; margin-right: 0.5rem; margin-top: 0.5rem; }
++    .btn { border: none; border-radius: 6px; padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer; font-weight: 600; }
++    .btn-approve { background: #2b8a3e; color: white; }
++    .btn-approve:hover { background: #237032; }
++    .btn-copy { background: #3b5bdb; color: white; }
++    .btn-copy:hover { background: #2f4bb3; }
++    .btn-dismiss { background: #e9ecef; color: #495057; }
++    .btn-dismiss:hover { background: #dee2e6; }
++    .banner { max-width: 680px; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
++    .banner-error { background: #fff3bf; color: #7d5a00; border: 1px solid #ffe066; }
++    .banner-success { background: #d3f9d8; color: #2b8a3e; border: 1px solid #b2f2bb; }
++    .top-nav { max-width: 680px; margin-bottom: 1.25rem; }
++    .top-nav a { color: #3b5bdb; text-decoration: none; font-size: 0.9rem; font-weight: 600; }
++    .top-nav a:hover { text-decoration: underline; }
++    form.add-review-form { background: white; border-radius: 8px; padding: 1.5rem; max-width: 500px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
++    form.add-review-form label { display: block; font-size: 0.85rem; font-weight: 600; margin: 0.85rem 0 0.3rem; }
++    form.add-review-form input, form.add-review-form select, form.add-review-form textarea {
++      width: 100%; box-sizing: border-box; padding: 0.5rem; border: 1px solid #dcdfe4; border-radius: 6px; font-size: 0.9rem; font-family: inherit;
++    }
++    form.add-review-form textarea { min-height: 90px; resize: vertical; }
++    form.add-review-form button { margin-top: 1.25rem; }
++`;
++
+ app.get('/', async (req, res) => {
+   const banner = req.query.error
+     ? `<div class="banner banner-error">Couldn't post that reply: ${escapeHtml(req.query.error)}</div>`
+     : req.query.posted
+       ? `<div class="banner banner-success">Reply posted.</div>`
+-      : '';
++      : req.query.sent
++        ? `<div class="banner banner-success">Marked as sent.</div>`
++        : req.query.added
++          ? `<div class="banner banner-success">Review added — AI is drafting a reply now.</div>`
++          : '';
+ 
+   const { data: replies, error } = await supabase
+     .from('replies')
+@@ -51,10 +109,28 @@ app.get('/', async (req, res) => {
+     .map((reply) => {
+       const review = reply.reviews;
+       const business = review.businesses;
++      const platform = PLATFORMS[review.platform];
++      const platformLabel = platform ? platform.label : review.platform;
++
++      const actionButton = platform && platform.canAutoPost
++        ? `<form class="actions" method="POST" action="/approve/${reply.id}">
++             <button type="submit" class="btn btn-approve">Approve & Post</button>
++           </form>`
++        : `<form class="actions" method="POST" action="/mark-sent/${reply.id}"
++                 onsubmit="event.preventDefault(); const f = event.target; const go = () => f.submit();
++                           if (navigator.clipboard) { navigator.clipboard.writeText(${JSON.stringify(reply.draft_text)}).then(go, go); } else { go(); }">
++             <button type="submit" class="btn btn-copy">Copy Reply &amp; Mark Sent</button>
++           </form>`;
++
++      const manualNote = platform && !platform.canAutoPost
++        ? `<div class="manual-note">${escapeHtml(platformLabel)} has no reply-posting API — this copies the draft to your clipboard. Paste it into ${escapeHtml(platformLabel)} yourself, then click to mark it handled.</div>`
++        : '';
++
+       return `
+       <div class="card">
+         <div class="card-header">
+           <span class="business">${escapeHtml(business.name)}</span>
++          <span class="platform-tag">${escapeHtml(platformLabel)}</span>
+           <span class="stars">${starDisplay(review.rating)}</span>
+           <span class="reviewer">${escapeHtml(review.reviewer_name || 'Anonymous')}</span>
+         </div>
+@@ -69,9 +145,8 @@ app.get('/', async (req, res) => {
+           </span>
+           <span class="notes-text">${escapeHtml(reply.safety_check_notes || '')}</span>
+         </div>
+-        <form class="actions" method="POST" action="/approve/${reply.id}">
+-          <button type="submit" class="btn btn-approve">Approve & Post</button>
+-        </form>
++        ${manualNote}
++        ${actionButton}
+         <form class="actions" method="POST" action="/dismiss/${review.id}">
+           <button type="submit" class="btn btn-dismiss">Dismiss (I'll respond myself)</button>
+         </form>
+@@ -84,37 +159,10 @@ app.get('/', async (req, res) => {
+ <head>
+   <meta charset="utf-8">
+   <title>Reply Engine — Review Queue</title>
+-  <style>
+-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f7f7f8; margin: 0; padding: 2rem; color: #1a1a1a; }
+-    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+-    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; font-size: 0.9rem; }
+-    .empty { background: white; border-radius: 8px; padding: 2rem; text-align: center; color: #666; }
+-    .card { background: white; border-radius: 8px; padding: 1.25rem 1.5rem; margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); max-width: 680px; }
+-    .card-header { display: flex; gap: 0.75rem; align-items: baseline; margin-bottom: 0.5rem; flex-wrap: wrap; }
+-    .business { font-weight: 600; }
+-    .stars { color: #f5a623; letter-spacing: 1px; }
+-    .reviewer { color: #666; font-size: 0.9rem; }
+-    .review-text { font-style: italic; color: #333; border-left: 3px solid #ddd; padding-left: 0.75rem; margin: 0.75rem 0; }
+-    .draft-box { background: #f0f4ff; border-radius: 6px; padding: 0.75rem 1rem; margin: 0.75rem 0; }
+-    .draft-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #3b5bdb; font-weight: 600; margin-bottom: 0.25rem; }
+-    .draft-text { margin: 0; }
+-    .notes { font-size: 0.85rem; margin: 0.5rem 0 1rem; }
+-    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600; font-size: 0.75rem; margin-right: 0.5rem; }
+-    .badge-pass { background: #d3f9d8; color: #2b8a3e; }
+-    .badge-fail { background: #ffe3e3; color: #c92a2a; }
+-    .notes-text { color: #888; }
+-    .actions { display: inline-block; margin-right: 0.5rem; margin-top: 0.5rem; }
+-    .btn { border: none; border-radius: 6px; padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer; font-weight: 600; }
+-    .btn-approve { background: #2b8a3e; color: white; }
+-    .btn-approve:hover { background: #237032; }
+-    .btn-dismiss { background: #e9ecef; color: #495057; }
+-    .btn-dismiss:hover { background: #dee2e6; }
+-    .banner { max-width: 680px; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+-    .banner-error { background: #fff3bf; color: #7d5a00; border: 1px solid #ffe066; }
+-    .banner-success { background: #d3f9d8; color: #2b8a3e; border: 1px solid #b2f2bb; }
+-  </style>
++  <style>${PAGE_STYLES}</style>
+ </head>
+ <body>
++  <div class="top-nav"><a href="/add-review">+ Add a Yelp review manually</a></div>
+   <h1>Review Queue</h1>
+   <p class="subtitle">${(replies || []).length} item(s) waiting for your decision</p>
+   ${banner}
+@@ -123,6 +171,95 @@ app.get('/', async (req, res) => {
+ </html>`);
+ });
+ 
++app.get('/add-review', async (req, res) => {
++  const { data: businesses, error } = await supabase.from('businesses').select('id, name').order('name');
++
++  if (error) {
++    res.status(500).send(`<p>Failed to load businesses: ${escapeHtml(error.message)}</p>`);
++    return;
++  }
++
++  const options = (businesses || [])
++    .map((b) => `<option value="${escapeHtml(b.id)}">${escapeHtml(b.name)}</option>`)
++    .join('\n');
++
++  res.send(`<!DOCTYPE html>
++<html>
++<head>
++  <meta charset="utf-8">
++  <title>Add a Yelp Review — Reply Engine</title>
++  <style>${PAGE_STYLES}</style>
++</head>
++<body>
++  <div class="top-nav"><a href="/">&larr; Back to queue</a></div>
++  <h1>Add a Yelp review</h1>
++  <p class="subtitle">Yelp doesn't give us API access to pull reviews automatically — paste one in here and it'll go through the same AI-drafting and safety-check pipeline as everything else.</p>
++  <form class="add-review-form" method="POST" action="/add-review">
++    <label for="business_id">Business</label>
++    <select id="business_id" name="business_id" required>
++      <option value="" disabled selected>Select a business</option>
++      ${options}
++    </select>
++
++    <label for="reviewer_name">Reviewer name</label>
++    <input id="reviewer_name" name="reviewer_name" type="text" placeholder="e.g. Sam T.">
++
++    <label for="rating">Star rating</label>
++    <select id="rating" name="rating" required>
++      <option value="5">5 stars</option>
++      <option value="4">4 stars</option>
++      <option value="3">3 stars</option>
++      <option value="2">2 stars</option>
++      <option value="1">1 star</option>
++    </select>
++
++    <label for="review_text">Review text</label>
++    <textarea id="review_text" name="review_text" placeholder="Paste the review text from Yelp here"></textarea>
++
++    <button type="submit" class="btn btn-approve">Add & Draft Reply</button>
++  </form>
++</body>
++</html>`);
++});
++
++app.post('/add-review', async (req, res) => {
++  const { business_id, reviewer_name, rating, review_text } = req.body;
++
++  if (!business_id || !rating) {
++    res.redirect('/add-review');
++    return;
++  }
++
++  const { data: review, error } = await supabase
++    .from('reviews')
++    .insert({
++      business_id,
++      platform: 'yelp',
++      entry_method: 'manual',
++      external_review_id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
++      reviewer_name: reviewer_name || 'Anonymous',
++      rating: Number(rating),
++      review_text: review_text || '',
++      review_created_at: new Date().toISOString(),
++      status: 'pending'
++    })
++    .select()
++    .single();
++
++  if (error) {
++    res.status(500).send(`<p>Failed to save review: ${escapeHtml(error.message)}</p>`);
++    return;
++  }
++
++  try {
++    await draftAndHandleReply(review, business_id);
++  } catch (err) {
++    console.error('[dashboard] draft failed for manually-added review:', err.message);
++  }
++
++  res.redirect('/?added=1');
++});
++
+ app.post('/approve/:replyId', async (req, res) => {
+   let result;
+   try {
+@@ -139,6 +276,22 @@ app.post('/approve/:replyId', async (req, res) => {
+   }
+ });
+ 
++app.post('/mark-sent/:replyId', async (req, res) => {
++  let result;
++  try {
++    result = await markManuallySent(req.params.replyId);
++  } catch (err) {
++    console.error('[dashboard] mark-sent failed:', err.message);
++    result = { success: false, reason: err.message };
++  }
++
++  if (result.success) {
++    res.redirect('/?sent=1');
++  } else {
++    res.redirect(`/?error=${encodeURIComponent(result.reason || 'unknown error')}`);
++  }
++});
++
+ app.post('/dismiss/:reviewId', async (req, res) => {
+   await supabase.from('reviews').update({ status: 'skipped' }).eq('id', req.params.reviewId);
+   res.redirect('/');
+diff --git a/scripts/draftReply.js b/scripts/draftReply.js
+index ad000ad..0991952 100644
+--- a/scripts/draftReply.js
++++ b/scripts/draftReply.js
+@@ -11,6 +11,7 @@ require('dotenv').config();
+ const { supabase, logAction } = require('../src/db');
+ const { draftReply, safetyCheck, assessSeverity } = require('../src/llm');
+ const { postApprovedReply } = require('./postReply');
++const { PLATFORMS } = require('../src/platforms');
+ 
+ async function draftAndHandleReply(review, businessId) {
+   const { data: business, error: bizErr } = await supabase
+@@ -60,11 +61,18 @@ async function draftAndHandleReply(review, businessId) {
+     check = { passed: false, notes: 'FAIL: safety check call errored, holding for manual review' };
+   }
+ 
+-  // Held for the owner, regardless of how clean the draft is, when either is true:
+-  // (a) low star rating (spec §5 "negative-review flag"), or (b) the text itself reads as
+-  // scathing/serious even at 3+ stars (assessed above, before drafting). The owner decides
+-  // whether and how to respond personally in both cases.
+-  const forceHold = review.rating <= 2 || severity.scathing;
++  // Whether this platform can even post a reply automatically at all. Facebook has no reply
++  // API and Yelp has no API access, period — those are always held for the owner to copy the
++  // draft over by hand, independent of star rating or how the draft/safety checks came out.
++  const platformCanAutoPost = Boolean(PLATFORMS[review.platform]?.canAutoPost);
++
++  // Held for the owner, regardless of how clean the draft is, when any of these is true:
++  // (a) low star rating (spec §5 "negative-review flag"), (b) the text itself reads as
++  // scathing/serious even at 3+ stars (assessed above, before drafting), or (c) the platform
++  // doesn't support automated posting in the first place. The owner decides whether/how to
++  // respond personally in the first two cases; in the third, there's simply no API to post
++  // through, so "holding" just means "drafted and waiting for you to copy it over."
++  const forceHold = review.rating <= 2 || severity.scathing || !platformCanAutoPost;
+   const holdForReview = forceHold || !check.passed;
+ 
+   const { data: reply, error: replyErr } = await supabase
+@@ -98,7 +106,9 @@ async function draftAndHandleReply(review, businessId) {
+       ? 'low_star_rating'
+       : severity.scathing
+         ? 'scathing_review_text'
+-        : 'failed_safety_check';
++        : !platformCanAutoPost
++          ? 'platform_has_no_auto_post'
++          : 'failed_safety_check';
+     await logAction(businessId, 'reply_flagged', {
+       review_id: review.id,
+       reason,
+diff --git a/scripts/pollReviews.js b/scripts/pollReviews.js
+index fd7890a..ec0e93c 100644
+--- a/scripts/pollReviews.js
++++ b/scripts/pollReviews.js
+@@ -1,19 +1,25 @@
+ #!/usr/bin/env node
+-// Phase 1 pipeline, step 1: poll every active business's connected Google Business Profile
+-// for new reviews, upsert them into the `reviews` table, and kick off reply drafting for
+-// anything new. Meant to be run on a schedule (n8n / cron — see workflows/README.md).
++// Phase 1 pipeline, step 1: poll every active business's connected review platforms for new
++// reviews, upsert them into the `reviews` table, and kick off reply drafting for anything new.
++// Meant to be run on a schedule (n8n / cron — see workflows/README.md).
++//
++// Polls every platform in PLATFORMS with canFetch: true (currently google, trustpilot,
++// facebook). Yelp has no API access at all, so it's excluded here — those reviews come in
++// through the dashboard's manual-entry form instead (see scripts/dashboard.js).
+ //
+ // Usage: node scripts/pollReviews.js
+ 
+ require('dotenv').config();
+ const { supabase, logAction } = require('../src/db');
+-const { getValidAccessToken, fetchReviews } = require('../src/googleBusinessProfile');
++const { PLATFORMS, POLLABLE_PLATFORMS } = require('../src/platforms');
+ const { draftAndHandleReply } = require('./draftReply');
+ 
+ async function pollBusiness(connection) {
++  const platform = PLATFORMS[connection.platform];
++
+   let accessToken;
+   try {
+-    accessToken = await getValidAccessToken(connection, supabase);
++    accessToken = await platform.getValidAccessToken(connection, supabase);
+   } catch (err) {
+     if (err.code === 'REAUTH_REQUIRED') {
+       await supabase
+@@ -23,16 +29,16 @@ async function pollBusiness(connection) {
+       await logAction(connection.business_id, 'reauth_required', { platform: connection.platform });
+       // TODO (Section 6 of spec): trigger the automated "reconnect" email here.
+     } else {
+-      console.error(`[pollReviews] token error for business ${connection.business_id}:`, err.message);
++      console.error(`[pollReviews] token error for business ${connection.business_id} (${connection.platform}):`, err.message);
+     }
+     return;
+   }
+ 
+   let fetched;
+   try {
+-    fetched = await fetchReviews(connection, accessToken);
++    fetched = await platform.fetchReviews(connection, accessToken);
+   } catch (err) {
+-    console.error(`[pollReviews] fetch error for business ${connection.business_id}:`, err.message);
++    console.error(`[pollReviews] fetch error for business ${connection.business_id} (${connection.platform}):`, err.message);
+     return;
+   }
+ 
+@@ -44,6 +50,7 @@ async function pollBusiness(connection) {
+         {
+           business_id: connection.business_id,
+           platform: connection.platform,
++          entry_method: 'api',
+           ...review
+         },
+         { onConflict: 'platform,external_review_id', ignoreDuplicates: false }
+@@ -72,7 +79,7 @@ async function main() {
+   const { data: connections, error } = await supabase
+     .from('platform_connections')
+     .select('*, businesses!inner(subscription_status)')
+-    .eq('platform', 'google')
++    .in('platform', POLLABLE_PLATFORMS)
+     .eq('status', 'active')
+     .eq('businesses.subscription_status', 'active');
+ 
+@@ -81,9 +88,9 @@ async function main() {
+     process.exit(1);
+   }
+ 
+-  console.log(`[pollReviews] polling ${connections.length} connected business(es)...`);
++  console.log(`[pollReviews] polling ${connections.length} connected business(es) across ${POLLABLE_PLATFORMS.join(', ')}...`);
+ 
+-  // Sequential on purpose for the MVP — simple, avoids Google rate limits.
++  // Sequential on purpose for the MVP — simple, avoids per-platform rate limits.
+   // Parallelize with a concurrency limiter (p-limit) once volume justifies it.
+   for (const connection of connections) {
+     await pollBusiness(connection);
+diff --git a/scripts/postReply.js b/scripts/postReply.js
+index 64ed552..6c26fda 100644
+--- a/scripts/postReply.js
++++ b/scripts/postReply.js
+@@ -1,14 +1,29 @@
+ // Phase 1 pipeline, step 3: post an approved (safety-check-passed, not held) reply back to
+-// Google, and log the result. Also exposes postManuallyApproved() for the dashboard's
+-// "approve this held reply" button — same posting logic, different entry trigger.
++// whichever platform the review came from, and log the result. Also exposes
++// postManuallyApproved() for the dashboard's "approve this held reply" button — same posting
++// logic, different entry trigger.
+ //
+ // Both functions return { success, reason } so callers (the dashboard especially) can show
+ // the person WHY a post attempt did nothing, instead of it looking like the button is broken.
++//
++// Only ever called for platforms where PLATFORMS[platform].canAutoPost is true (google,
++// trustpilot) — draftReply.js already forces facebook/yelp reviews to hold instead of reaching
++// this path. postApprovedReply still guards against it directly below, in case something calls
++// in from elsewhere later.
+ 
+ const { supabase, logAction } = require('../src/db');
+-const { getValidAccessToken, postReply } = require('../src/googleBusinessProfile');
++const { PLATFORMS } = require('../src/platforms');
+ 
+ async function postApprovedReply(review, reply, businessId) {
++  const platform = PLATFORMS[review.platform];
++
++  if (!platform || !platform.canAutoPost) {
++    const reason = `${review.platform} has no reply-posting API — copy the draft over manually instead.`;
++    console.error(`[postReply] ${reason} (business ${businessId})`);
++    await logAction(businessId, 'reply_post_failed', { review_id: review.id, reason });
++    return { success: false, reason };
++  }
++
+   const { data: connection, error } = await supabase
+     .from('platform_connections')
+     .select('*')
+@@ -24,8 +39,8 @@ async function postApprovedReply(review, reply, businessId) {
+   }
+ 
+   try {
+-    const accessToken = await getValidAccessToken(connection, supabase);
+-    await postReply(connection, accessToken, review.external_review_id, reply.draft_text);
++    const accessToken = await platform.getValidAccessToken(connection, supabase);
++    await platform.postReply(connection, accessToken, review.external_review_id, reply.draft_text);
+   } catch (err) {
+     console.error(`[postReply] failed to post reply ${reply.id}:`, err.message);
+     await logAction(businessId, 'reply_post_failed', { review_id: review.id, reason: err.message });
+@@ -66,4 +81,32 @@ async function postManuallyApproved(replyId) {
+   return postApprovedReply(review, reply, review.business_id);
+ }
+ 
+-module.exports = { postApprovedReply, postManuallyApproved };
++// Called from the dashboard's "Copy Reply" flow for platforms with no posting API at all
++// (Facebook, Yelp). No API call happens — this just records that the owner has taken the
++// draft and handled it themselves outside the system, so it stops showing up in the queue.
++async function markManuallySent(replyId) {
++  const { data: reply, error: replyErr } = await supabase
++    .from('replies')
++    .select('*, reviews!inner(*)')
++    .eq('id', replyId)
++    .single();
++
++  if (replyErr || !reply) {
++    return { success: false, reason: (replyErr && replyErr.message) || 'reply not found' };
++  }
++
++  const review = reply.reviews;
++  const now = new Date().toISOString();
++
++  await supabase.from('replies').update({ posted: true, posted_at: now }).eq('id', reply.id);
++  await supabase.from('reviews').update({ status: 'replied' }).eq('id', review.id);
++  await logAction(review.business_id, 'reply_marked_sent_manually', {
++    review_id: review.id,
++    reply_id: reply.id,
++    platform: review.platform
++  });
++
++  return { success: true };
++}
++
++module.exports = { postApprovedReply, postManuallyApproved, markManuallySent };
+diff --git a/sql/002_multi_platform.sql b/sql/002_multi_platform.sql
+new file mode 100644
+index 0000000..b69241f
+--- /dev/null
++++ b/sql/002_multi_platform.sql
+@@ -0,0 +1,13 @@
++-- Reply Engine — Phase 1.5: multi-platform support (Facebook fetch-only, Yelp manual entry,
++-- Trustpilot fetch+reply). Run once, after 001_init_schema.sql.
++--
++-- No new platform enum/constraint existed on `platform_connections.platform` or `reviews.platform`
++-- (both were always free text), so facebook/yelp/trustpilot values already work with the existing
++-- schema. The only real addition is tracking how a review entered the system, since Yelp reviews
++-- come in by hand rather than through a poll.
++
++alter table reviews
++  add column if not exists entry_method text not null default 'api'; -- api | manual
++
++comment on column reviews.entry_method is
++  'api = pulled by pollReviews.js from a connected platform. manual = typed in via the dashboard (Yelp, until Yelp grants API access).';
+diff --git a/src/facebook.js b/src/facebook.js
+new file mode 100644
+index 0000000..7680a97
+--- /dev/null
++++ b/src/facebook.js
+@@ -0,0 +1,54 @@
++// Facebook Graph API helper — fetching Page ratings & recommendations.
++//
++// Docs: https://developers.facebook.com/docs/graph-api/reference/page/ratings/
++//
++// IMPORTANT: this is fetch-only. Meta's Graph API does not expose a create/reply endpoint for
++// Page ratings & recommendations at all (confirmed at build time) — there is no way to post a
++// business reply back to Facebook through the API, regardless of permissions granted. Every
++// review pulled in here is therefore always held for the owner to copy the AI-drafted reply
++// over manually (see PLATFORMS.facebook.canAutoPost in src/platforms.js).
++//
++// connection.external_account_id = the Facebook Page ID.
++// connection.access_token = a long-lived Page access token (pages_read_engagement scope).
++// Page tokens don't expire on the same short cycle as Google's — no refresh flow implemented
++// yet; if a token is revoked/expired, fetchReviews will throw a REAUTH_REQUIRED error below.
++
++const GRAPH_API_BASE = 'https://graph.facebook.com/v19.0'; // verify current version before launch
++
++// No refresh cycle for now — Page tokens are long-lived. Kept as a function (rather than reading
++// connection.access_token directly everywhere) so a real refresh flow can slot in later without
++// touching callers.
++async function getValidAccessToken(connection) {
++  return connection.access_token;
++}
++
++// Fetches ratings/recommendations for one connected Page, newest first.
++async function fetchReviews(connection, accessToken) {
++  const url = `${GRAPH_API_BASE}/${connection.external_account_id}/ratings?fields=reviewer,rating,review_text,created_time,open_graph_story&access_token=${accessToken}`;
++  const res = await fetch(url);
++
++  if (res.status === 401 || res.status === 403) {
++    throw Object.assign(new Error('Facebook auth rejected — token may need re-consent'), {
++      code: 'REAUTH_REQUIRED'
++    });
++  }
++  if (!res.ok) {
++    throw new Error(`Facebook fetchReviews failed (${res.status}): ${await res.text()}`);
++  }
++
++  const data = await res.json();
++  return (data.data || [])
++    // Facebook recommendations don't always carry a star rating (it's a thumbs up/down
++    // "recommends" model in most locales) — skip anything without one since our pipeline
++    // is built around a 1-5 scale.
++    .filter((r) => typeof r.rating === 'number')
++    .map((r) => ({
++      external_review_id: r.open_graph_story?.id || `${connection.external_account_id}-${r.created_time}`,
++      reviewer_name: r.reviewer?.name || 'Anonymous',
++      rating: r.rating,
++      review_text: r.review_text || '',
++      review_created_at: r.created_time
++    }));
++}
++
++module.exports = { getValidAccessToken, fetchReviews };
+diff --git a/src/platforms.js b/src/platforms.js
+new file mode 100644
+index 0000000..5e68ffc
+--- /dev/null
++++ b/src/platforms.js
+@@ -0,0 +1,56 @@
++// Central registry of which review platforms the pipeline knows about, and what each one can
++// actually do. This is the single place that encodes a hard business/legal reality:
++//
++//   - Google Business Profile and Trustpilot both offer a real, sanctioned API for posting a
++//     business reply — so those can be fully automated end to end.
++//   - Facebook's Graph API can fetch Page ratings/recommendations but has no reply-posting
++//     endpoint at all, for anyone, at any permission level. Not a gap we can close later without
++//     Meta shipping a new API — it just doesn't exist.
++//   - Yelp doesn't expose a public API for reading or replying to reviews to ordinary businesses
++//     (that's gated behind an invite-only Partner API for large reputation platforms). Reviews
++//     get into the pipeline by manual entry through the dashboard instead of polling.
++//
++// draftReply.js and pollReviews.js/dashboard.js read `canAutoPost` / `canFetch` from here rather
++// than hardcoding platform names, so this file is the one place to touch if that ever changes
++// (e.g. Yelp grants API access, or Meta adds a reply endpoint).
++
++const google = require('./googleBusinessProfile');
++const trustpilot = require('./trustpilot');
++const facebook = require('./facebook');
++
++const PLATFORMS = {
++  google: {
++    label: 'Google',
++    canFetch: true,
++    canAutoPost: true,
++    getValidAccessToken: google.getValidAccessToken,
++    fetchReviews: google.fetchReviews,
++    postReply: google.postReply
++  },
++  trustpilot: {
++    label: 'Trustpilot',
++    canFetch: true,
++    canAutoPost: true,
++    getValidAccessToken: trustpilot.getValidAccessToken,
++    fetchReviews: trustpilot.fetchReviews,
++    postReply: trustpilot.postReply
++  },
++  facebook: {
++    label: 'Facebook',
++    canFetch: true,
++    canAutoPost: false, // Graph API has no reply endpoint for ratings/recommendations — ever.
++    getValidAccessToken: facebook.getValidAccessToken,
++    fetchReviews: facebook.fetchReviews
++  },
++  yelp: {
++    label: 'Yelp',
++    canFetch: false, // no public API access for reading reviews (Partner API is invite-only).
++    canAutoPost: false, // same — no public API access for posting replies either.
++    entryMethod: 'manual'
++  }
++};
++
++// Platforms pollReviews.js should actually poll on a schedule.
++const POLLABLE_PLATFORMS = Object.keys(PLATFORMS).filter((p) => PLATFORMS[p].canFetch);
++
++module.exports = { PLATFORMS, POLLABLE_PLATFORMS };
+diff --git a/src/trustpilot.js b/src/trustpilot.js
+new file mode 100644
+index 0000000..d3876d2
+--- /dev/null
++++ b/src/trustpilot.js
+@@ -0,0 +1,109 @@
++// Trustpilot Service Reviews API helpers — fetching new reviews and posting replies.
++//
++// Docs: https://developers.trustpilot.com/service-reviews-api (confirm current endpoint paths
++// at build time — Trustpilot has versioned this API before).
++//
++// Unlike Google, Trustpilot splits auth in two:
++//   - Reading reviews uses a plain API key (TRUSTPILOT_API_KEY env var) — no per-business OAuth.
++//   - Posting a reply requires a Business User OAuth token, scoped to the business that connected
++//     their account (stored per-connection in platform_connections, refreshed below like Google's).
++//
++// connection.external_account_id = the Trustpilot Business Unit ID for this business.
++// connection.access_token / refresh_token = the Business User OAuth token used only for replying.
++
++const TRUSTPILOT_API_BASE = 'https://api.trustpilot.com/v1';
++
++async function refreshTrustpilotToken(connection) {
++  const res = await fetch(`${TRUSTPILOT_API_BASE}/oauth/oauth-business-users-for-applications/refresh`, {
++    method: 'POST',
++    headers: {
++      'Content-Type': 'application/x-www-form-urlencoded',
++      Authorization: `Basic ${Buffer.from(
++        `${process.env.TRUSTPILOT_CLIENT_ID}:${process.env.TRUSTPILOT_CLIENT_SECRET}`
++      ).toString('base64')}`
++    },
++    body: new URLSearchParams({
++      grant_type: 'refresh_token',
++      refresh_token: connection.refresh_token
++    })
++  });
++
++  if (!res.ok) {
++    throw new Error(`Trustpilot token refresh failed (${res.status}): ${await res.text()}`);
++  }
++
++  const data = await res.json();
++  return {
++    access_token: data.access_token,
++    refresh_token: data.refresh_token || connection.refresh_token,
++    expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString()
++  };
++}
++
++// Returns a valid Business User OAuth token, refreshing first if it's expired or close to it.
++// Only needed for postReply — fetchReviews uses the flat API key instead.
++async function getValidAccessToken(connection, supabase) {
++  const expiresAt = connection.token_expires_at ? new Date(connection.token_expires_at) : null;
++  const needsRefresh = !expiresAt || expiresAt.getTime() - Date.now() < 5 * 60 * 1000;
++
++  if (!needsRefresh) return connection.access_token;
++
++  const refreshed = await refreshTrustpilotToken(connection);
++
++  await supabase
++    .from('platform_connections')
++    .update({
++      access_token: refreshed.access_token,
++      refresh_token: refreshed.refresh_token,
++      token_expires_at: refreshed.expires_at,
++      updated_at: new Date().toISOString()
++    })
++    .eq('id', connection.id);
++
++  return refreshed.access_token;
++}
++
++// Fetches reviews for one connected business unit, newest first.
++async function fetchReviews(connection) {
++  const url = `${TRUSTPILOT_API_BASE}/business-units/${connection.external_account_id}/reviews`;
++  const res = await fetch(url, {
++    headers: { apikey: process.env.TRUSTPILOT_API_KEY }
++  });
++
++  if (res.status === 401 || res.status === 403) {
++    throw Object.assign(new Error('Trustpilot API key rejected'), { code: 'REAUTH_REQUIRED' });
++  }
++  if (!res.ok) {
++    throw new Error(`Trustpilot fetchReviews failed (${res.status}): ${await res.text()}`);
++  }
++
++  const data = await res.json();
++  return (data.reviews || []).map((r) => ({
++    external_review_id: r.id,
++    reviewer_name: r.consumer?.displayName || 'Anonymous',
++    rating: r.stars,
++    review_text: r.text || '',
++    review_created_at: r.createdAt
++  }));
++}
++
++// Posts a business reply to a specific review.
++async function postReply(connection, accessToken, externalReviewId, replyText) {
++  const url = `${TRUSTPILOT_API_BASE}/private/reviews/${externalReviewId}/reply`;
++  const res = await fetch(url, {
++    method: 'POST',
++    headers: {
++      Authorization: `Bearer ${accessToken}`,
++      'Content-Type': 'application/json'
++    },
++    body: JSON.stringify({ message: replyText })
++  });
++
++  if (!res.ok) {
++    throw new Error(`Trustpilot postReply failed (${res.status}): ${await res.text()}`);
++  }
++
++  return res.json();
++}
++
++module.exports = { getValidAccessToken, fetchReviews, postReply };
+-- 
+2.43.0
+
